@@ -232,16 +232,33 @@ def step_collect() -> Path:
     ensure_dirs()
     libs = sorted(FULL_OUTPUT.glob("*.a"))
 
-    # 兜底：如果 FULL_OUTPUT 里没有 protobuf，去源目录找
-    has_protobuf = any("protobuf" in p.name.lower() for p in libs)
-    if not has_protobuf:
-        log("⚠️ FULL_OUTPUT 里没有 protobuf，从 external/protobuf/out 兜底查找")
-        for cand in sorted(PROTOBUF_SRC.glob("out/**/*.a")):
-            if "protobuf" in cand.name.lower():
+    # 兜底：第三方依赖可能没被拷进 FULL_OUTPUT，去各自 out 目录找。
+    # 缺任何一个都会在链接期报未定义符号（实测：brotli 最先暴露）。
+    THIRD_PARTY = {
+        "protobuf": PROTOBUF_SRC / "out",
+        "brotli":   ROOT / "external" / "brotli" / "out",
+        "lz4":      ROOT / "external" / "lz4" / "contrib" / "cmake_unofficial" / "out",
+        "zstd":     ROOT / "external" / "zstd" / "build" / "cmake" / "out",
+    }
+    present = " ".join(sorted(p.name for p in libs))
+    log(f"FULL_OUTPUT 现有库: {present}")
+
+    for key, base in THIRD_PARTY.items():
+        if any(key in p.name.lower() for p in libs):
+            continue
+        found = False
+        if base.is_dir():
+            for cand in sorted(base.rglob("*.a")):
                 dst = FULL_OUTPUT / cand.name
+                if dst.exists():
+                    continue
                 shutil.copy2(cand, dst)
-                log(f"  补入 {cand.name}  {cand.stat().st_size:,} B")
+                log(f"  补入 [{key}] {cand.name}  {cand.stat().st_size:,} B")
                 libs.append(dst)
+                found = True
+        if not found:
+            log(f"  ⚠️ {key} 未找到静态库（目录 {base}）")
+    libs = sorted(set(libs))
 
     if not libs:
         die(f"{FULL_OUTPUT} 下无 .a 产物")
@@ -249,9 +266,17 @@ def step_collect() -> Path:
     for p in libs:
         log(f"  {p.name}  {p.stat().st_size:,} B")
 
-    # 硬校验：protobuf 运行时必须在，否则链接期必然缺 protobuf 符号
-    if not any("protobuf" in p.name.lower() for p in libs):
-        die("缺少 protobuf 静态库，链接会报 google::protobuf::internal::TcParser 未定义")
+    # 硬校验：第三方运行时一个都不能少
+    REQUIRED_LIBS = {
+        "protobuf": "TcParser 未定义",
+        "brotli":   "BrotliDecoderCreateInstance 未定义",
+        "lz4":      "LZ4_decompress 未定义",
+        "zstd":     "ZSTD_decompress 未定义",
+    }
+    names = " ".join(p.name.lower() for p in libs)
+    for key, sym in REQUIRED_LIBS.items():
+        if key not in names:
+            die(f"缺少 {key} 静态库，链接会报 {sym}")
 
     dist = ROOT / "dist"
     inc = dist / "include"
