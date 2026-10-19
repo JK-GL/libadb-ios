@@ -70,6 +70,12 @@ jobs:
         working-directory: src
         run: python3 ../builder/scripts/build_libadb.py --root "$PWD" --stage patch
 
+      - name: 编译压缩库（brotli / lz4 / zstd）
+        working-directory: src
+        run: |
+          set -o pipefail
+          python3 ../builder/scripts/build_libadb.py --root "$PWD" --stage compress
+
       - name: 编译 libadb
         id: adb
         continue-on-error: true
