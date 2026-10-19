@@ -26,13 +26,15 @@ from pathlib import Path
 # ---- 版本锚点 ----
 ANDROID_TOOLS_TAG = "35.0.2"   # porting/*.cpp 针对 platform-tools 35.0.2 改造
 PROTOBUF_VERSION = "28.3"      # 28.x 只引 absl_log.h，不会与 adb_trace.h 的 LOG 宏冲突
-TARGET = "iphoneos/arm64"
+TARGET = "adb/iphoneos/arm64"   # 上游格式：<lib>/<sdk>/<arch>，lib 段决定 LIB_NAME
 
 ROOT = Path(os.environ.get("LIBADB_ROOT", Path.cwd())).resolve()
 ANDROID_TOOLS: Path = ROOT / "android-tools"
 PROTOBUF_SRC: Path = ROOT / "external" / "protobuf"
 OUTPUT: Path = ROOT / "output"
-FULL_OUTPUT: Path = OUTPUT / TARGET
+# 产物实际落在 output/<sdk>/<arch>/
+_SDK, _ARCH = TARGET.split("/")[1], TARGET.split("/")[2]
+FULL_OUTPUT: Path = OUTPUT / _SDK / _ARCH
 
 
 def log(msg: str) -> None:
@@ -246,9 +248,11 @@ def main() -> None:
         ANDROID_TOOLS = ROOT / "android-tools"
         PROTOBUF_SRC = ROOT / "external" / "protobuf"
         OUTPUT = ROOT / "output"
-        FULL_OUTPUT = OUTPUT / TARGET
+        FULL_OUTPUT = OUTPUT / TARGET.split("/")[1] / TARGET.split("/")[2]
 
     log(f"ROOT = {ROOT}")
+    if TARGET.count("/") != 2:
+        die(f"TARGET 格式错误：{TARGET!r}，必须是 <lib>/<sdk>/<arch>")
     if not (ROOT / "porting").is_dir():
         die(f"{ROOT} 下没有 porting/，请用 --root 指定 adb-mobile 源码根")
     ensure_dirs()
