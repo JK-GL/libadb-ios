@@ -26,7 +26,8 @@ ANDROID_TOOLS_TAG = "35.0.2"   # porting/*.cpp 是针对 platform-tools 35.0.2 �
 PROTOBUF_VERSION = "28.3"      # 28.x 的 descriptor.h 只引 absl_log.h，不会和 adb 的 LOG 宏打架
 TARGET = "iphoneos/arm64"
 
-ROOT = Path(__file__).resolve().parent.parent
+# 项目根：由 --root 注入，默认取当前工作目录（CI 里是 src/）
+ROOT = Path(os.environ.get("LIBADB_ROOT", Path.cwd())).resolve()
 ANDROID_TOOLS = ROOT / "android-tools"
 PROTOBUF_SRC = ROOT / "external" / "protobuf"
 OUTPUT = ROOT / "output"
@@ -195,7 +196,19 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--stage", default="all",
                     choices=["all", "pin", "protoc", "protobuf", "patch", "adb", "collect"])
+    ap.add_argument("--root", default=None, help="adb-mobile 源码根目录，默认当前目录")
     args = ap.parse_args()
+
+    global ROOT, ANDROID_TOOLS, PROTOBUF_SRC, OUTPUT, FULL_OUTPUT
+    if args.root:
+        ROOT = Path(args.root).resolve()
+        ANDROID_TOOLS = ROOT / "android-tools"
+        PROTOBUF_SRC = ROOT / "external" / "protobuf"
+        OUTPUT = ROOT / "output"
+        FULL_OUTPUT = OUTPUT / TARGET
+    log(f"ROOT = {ROOT}")
+    if not (ROOT / "porting").is_dir():
+        die(f"{ROOT} 下没有 porting/，不是 adb-mobile 源码根。请用 --root 指定。")
 
     t0 = time.time()
     if args.stage in ("all", "pin"):
