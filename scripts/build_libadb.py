@@ -103,6 +103,37 @@ def step_protoc() -> None:
         )
 
 
+def step_patch_protobuf_submodule() -> None:
+    """
+    上游 make-protobuf.sh 会 `git checkout v$protoc_version`，
+    但 submodule 是浅克隆，没有 tags，必然报
+    "pathspec 'v28.3' did not match any file(s) known to git"。
+    这里先把 tags 拉全，并保证 abseil-cpp 也到位。
+    """
+    ensure_dirs()
+    if not PROTOBUF_SRC.is_dir():
+        die(f"{PROTOBUF_SRC} 不存在，external/protobuf submodule 未检出")
+
+    log("为 external/protobuf 拉取全部 tags")
+    run(["git", "fetch", "--tags", "--unshallow"], cwd=PROTOBUF_SRC, check=False)
+    run(["git", "fetch", "--tags"], cwd=PROTOBUF_SRC, check=False)
+
+    tags = run(["git", "tag", "-l", "v28*"], cwd=PROTOBUF_SRC, capture=True).stdout.strip()
+    log(f"匹配 v28* 的标签: {tags.split() if tags else '无'}")
+    if f"v{PROTOBUF_VERSION}" not in tags.split():
+        die(f"拉取后仍找不到 tag v{PROTOBUF_VERSION}，检查网络或 submodule remote")
+
+    log("检出 protobuf 28.3 并同步 abseil")
+    run(["git", "checkout", "-f", f"v{PROTOBUF_VERSION}"], cwd=PROTOBUF_SRC)
+    run(["git", "submodule", "update", "--init", "--recursive", "--force"], cwd=PROTOBUF_SRC)
+
+    absl = PROTOBUF_SRC / "third_party" / "abseil-cpp"
+    hdr = absl / "absl" / "strings" / "string_view.h"
+    log(f"abseil 头文件存在: {hdr.is_file()}  ({hdr})")
+    if not hdr.is_file():
+        die("abseil-cpp 未就位，protobuf 无法编译")
+
+
 def step_protobuf() -> None:
     """编 iOS 版 protobuf 28.3 静态库。"""
     ensure_dirs()
@@ -161,10 +192,13 @@ def step_patch_makeadb() -> None:
     if anchor not in text:
         die(f"patch 锚点 {anchor!r} 不存在")
 
+    absl_dir = "$SOURCE_ROOT/external/protobuf/third_party/abseil-cpp"
     inject = (
         "\t-DLIBADB_PROTOBUF_PATHS=1 \\\n"
         '\t-DProtobuf_INCLUDE_DIR="$SOURCE_ROOT/external/protobuf/src" \\\n'
         '\t-DProtobuf_INCLUDE_DIRS="$SOURCE_ROOT/external/protobuf/src" \\\n'
+        f'\t-DCMAKE_CXX_FLAGS="-I{absl_dir}" \\\n'
+        f'\t-DCMAKE_C_FLAGS="-I{absl_dir}" \\\n'
         '\t-DProtobuf_LIBRARY="$FULL_OUTPUT/libprotobuf.a" \\\n'
         '\t-DProtobuf_PROTOC_EXECUTABLE="$(command -v protoc)" \\\n'
         + anchor
@@ -228,12 +262,13 @@ def step_collect() -> Path:
 STAGES = {
     "pin": step_pin,
     "protoc": step_protoc,
+    "patchpb": step_patch_protobuf_submodule,
     "protobuf": step_protobuf,
     "patch": lambda: (step_patch_cmake(), step_patch_makeadb()),
     "adb": step_adb,
     "collect": step_collect,
 }
-ORDER = ["pin", "protoc", "protobuf", "patch", "adb", "collect"]
+ORDER = ["pin", "protoc", "patchpb", "protobuf", "patch", "adb", "collect"]
 
 
 def main() -> None:
