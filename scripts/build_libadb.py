@@ -149,6 +149,23 @@ def step_protobuf() -> None:
         env=dict(os.environ, TARGET=TARGET, OUTPUT=str(OUTPUT)))
 
 
+def step_compress_libs() -> None:
+    """编译 brotli / lz4 / zstd。
+
+    adb 的 file_sync_client 用它们做 push/pull 压缩，
+    缺任何一个都会在 App 链接期报未定义符号。
+    这三个各自有独立 make 目标，不会被 adb 目标带上。
+    """
+    ensure_dirs()
+    for lib in ("lz4", "zstd", "brotli"):
+        log(f"编译 {lib} ({TARGET})")
+        script = ROOT / "porting" / "scripts" / f"make-{lib}.sh"
+        if not script.is_file():
+            die(f"缺少 {script}")
+        run(["bash", str(script)], cwd=ROOT / "porting",
+            env=dict(os.environ, TARGET=TARGET, OUTPUT=str(OUTPUT)))
+
+
 def step_patch_cmake() -> None:
     """
     阻止 CMake 用 CONFIG 模式找到 Homebrew 的 protobuf 36.x。
@@ -237,6 +254,7 @@ def step_collect() -> Path:
     THIRD_PARTY = {
         "protobuf": PROTOBUF_SRC / "out",
         "brotli":   ROOT / "external" / "brotli" / "out",
+        # brotli 的 xcode 构建会放在 out/Debug-iphoneos/ 下
         "lz4":      ROOT / "external" / "lz4" / "contrib" / "cmake_unofficial" / "out",
         "zstd":     ROOT / "external" / "zstd" / "build" / "cmake" / "out",
     }
@@ -333,11 +351,12 @@ STAGES = {
     "protoc": step_protoc,
     "patchpb": step_patch_protobuf_submodule,
     "protobuf": step_protobuf,
+    "compress": step_compress_libs,
     "patch": lambda: (step_patch_cmake(), step_patch_makeadb()),
     "adb": step_adb,
     "collect": step_collect,
 }
-ORDER = ["pin", "protoc", "patchpb", "protobuf", "patch", "adb", "collect"]
+ORDER = ["pin", "protoc", "patchpb", "protobuf", "patch", "compress", "adb", "collect"]
 
 
 def main() -> None:
