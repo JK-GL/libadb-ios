@@ -149,6 +149,32 @@ def step_protobuf() -> None:
         env=dict(os.environ, TARGET=TARGET, OUTPUT=str(OUTPUT)))
 
 
+def patch_zstd_script() -> None:
+    """给 make-zstd.sh 补 -DZSTD_BUILD_PROGRAMS=OFF。
+
+    zstd 的 programs/CMakeLists.txt 在 CMake 4.x 下会报：
+      install TARGETS given no BUNDLE DESTINATION for MACOSX_BUNDLE executable
+    我们只需要 libzstd_static.a，关掉命令行程序即可。
+    """
+    f = ROOT / "porting" / "scripts" / "make-zstd.sh"
+    if not f.is_file():
+        die(f"缺少 {f}")
+    text = f.read_text(encoding="utf-8")
+    if "ZSTD_BUILD_PROGRAMS" in text:
+        log("make-zstd.sh 已 patch，跳过")
+        return
+    anchor = "$CMAKE_COMPAT_FLAGS"
+    if anchor not in text:
+        die("make-zstd.sh 里找不到 cmake 参数锚点")
+    text = text.replace(
+        anchor,
+        "-DZSTD_BUILD_PROGRAMS=OFF -DZSTD_BUILD_SHARED=OFF " + anchor,
+        1,
+    )
+    f.write_text(text, encoding="utf-8")
+    log("make-zstd.sh patch 完成")
+
+
 def step_compress_libs() -> None:
     """编译 brotli / lz4 / zstd。
 
@@ -162,6 +188,9 @@ def step_compress_libs() -> None:
         script = ROOT / "porting" / "scripts" / f"make-{lib}.sh"
         if not script.is_file():
             die(f"缺少 {script}")
+
+        if lib == "zstd":
+            patch_zstd_script()
         run(["bash", str(script)], cwd=ROOT / "porting",
             env=dict(os.environ, TARGET=TARGET, OUTPUT=str(OUTPUT)))
 
