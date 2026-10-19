@@ -216,14 +216,38 @@ def step_adb() -> None:
 
 
 def step_collect() -> Path:
-    """合并所有 .a 并校验对外符号。"""
+    """合并所有 .a 并校验对外符号。
+
+    注意两点：
+    1. 上游 make-adb.sh 开头会 `git clean -fd` 清 android-tools，
+       但 protobuf 的产物在 external/ 下，不受影响。
+    2. make-protobuf.sh 会把 .a 拷进 FULL_OUTPUT，
+       但 make-adb.sh 每次也会往 FULL_OUTPUT 里拷，
+       所以直接扫 FULL_OUTPUT 即可，同时兜底扫 protobuf/out。
+    """
     ensure_dirs()
     libs = sorted(FULL_OUTPUT.glob("*.a"))
+
+    # 兜底：如果 FULL_OUTPUT 里没有 protobuf，去源目录找
+    has_protobuf = any("protobuf" in p.name.lower() for p in libs)
+    if not has_protobuf:
+        log("⚠️ FULL_OUTPUT 里没有 protobuf，从 external/protobuf/out 兜底查找")
+        for cand in sorted(PROTOBUF_SRC.glob("out/**/*.a")):
+            if "protobuf" in cand.name.lower():
+                dst = FULL_OUTPUT / cand.name
+                shutil.copy2(cand, dst)
+                log(f"  补入 {cand.name}  {cand.stat().st_size:,} B")
+                libs.append(dst)
+
     if not libs:
         die(f"{FULL_OUTPUT} 下无 .a 产物")
     log(f"找到 {len(libs)} 个静态库")
     for p in libs:
         log(f"  {p.name}  {p.stat().st_size:,} B")
+
+    # 硬校验：protobuf 运行时必须在，否则链接期必然缺 protobuf 符号
+    if not any("protobuf" in p.name.lower() for p in libs):
+        die("缺少 protobuf 静态库，链接会报 google::protobuf::internal::TcParser 未定义")
 
     dist = ROOT / "dist"
     inc = dist / "include"
@@ -256,6 +280,8 @@ def step_collect() -> Path:
         "adb_commandline_porting",  # 执行任意 adb 子命令（pair/connect/install/shell...）
         "capture_printf",           # 命令输出捕获
         "adb_trace_init_porting",   # trace 初始化
+        # protobuf 运行时：缺了它链接期报 TcParser 未定义
+        "_ZN6google8protobuf8internal8TcParser",
     ]
     missing = [x for x in REQUIRED if x not in syms]
     for sym in REQUIRED:
