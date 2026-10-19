@@ -2,36 +2,37 @@
 """
 libadb iOS 构建器
 
-用途：把 adb-mobile 的 ADB 移植在 macOS 上编成 iOS 静态库。
-所有步骤显式、可复现，失败时给出明确根因，不做猜测性重试。
+把 adb-mobile 的 ADB 移植编成 iOS 静态库。
+
+设计原则：
+1. 每一步都显式建目录，不依赖上游脚本的隐式行为
+2. 版本锚点是硬约束，不符就立刻失败，不做猜测性重试
+3. 失败时输出能直接定位问题的信息
 
 用法：
-    python3 scripts/build_libadb.py --stage all
-    python3 scripts/build_libadb.py --stage protobuf   # 只编 protobuf
-    python3 scripts/build_libadb.py --stage adb        # 只编 adb
+    python3 scripts/build_libadb.py --root <源码根> --stage all
+    python3 scripts/build_libadb.py --root <源码根> --stage protobuf
 """
 from __future__ import annotations
 
 import argparse
 import os
-import re
 import shutil
 import subprocess
 import sys
 import time
 from pathlib import Path
 
-# ---- 版本锚点：与 adb-mobile 的移植代码对齐，不要随意改动 ----
-ANDROID_TOOLS_TAG = "35.0.2"   # porting/*.cpp 是针对 platform-tools 35.0.2 改的
-PROTOBUF_VERSION = "28.3"      # 28.x 的 descriptor.h 只引 absl_log.h，不会和 adb 的 LOG 宏打架
+# ---- 版本锚点 ----
+ANDROID_TOOLS_TAG = "35.0.2"   # porting/*.cpp 针对 platform-tools 35.0.2 改造
+PROTOBUF_VERSION = "28.3"      # 28.x 只引 absl_log.h，不会与 adb_trace.h 的 LOG 宏冲突
 TARGET = "iphoneos/arm64"
 
-# 项目根：由 --root 注入，默认取当前工作目录（CI 里是 src/）
 ROOT = Path(os.environ.get("LIBADB_ROOT", Path.cwd())).resolve()
-ANDROID_TOOLS = ROOT / "android-tools"
-PROTOBUF_SRC = ROOT / "external" / "protobuf"
-OUTPUT = ROOT / "output"
-FULL_OUTPUT = OUTPUT / TARGET
+ANDROID_TOOLS: Path = ROOT / "android-tools"
+PROTOBUF_SRC: Path = ROOT / "external" / "protobuf"
+OUTPUT: Path = ROOT / "output"
+FULL_OUTPUT: Path = OUTPUT / TARGET
 
 
 def log(msg: str) -> None:
@@ -52,151 +53,191 @@ def run(cmd, cwd=None, check=True, capture=False, env=None):
     p = subprocess.run(cmd, **kwargs)
     if check and p.returncode != 0:
         if capture:
-            print(p.stdout[-3000:] if p.stdout else "")
-            print(p.stderr[-3000:] if p.stderr else "")
+            print((p.stdout or "")[-3000:])
+            print((p.stderr or "")[-3000:])
         die(f"命令失败（退出码 {p.returncode}）")
     return p
 
 
-def step_pin_android_tools() -> None:
-    """把 android-tools 钉到 35.0.2。submodule 默认跟 master，会拉到 37.x 导致源码对不上。"""
-    log(f"钉住 android-tools -> {ANDROID_TOOLS_TAG}")
-    if not ANDROID_TOOLS.is_dir():
-        die("android-tools 目录不存在，检查 submodule 是否已检出")
+def ensure_dirs() -> None:
+    """defines.sh 里用的是 `cd $OUTPUT` 而不是 mkdir -p，所以目录必须预先存在。"""
+    for d in (OUTPUT, FULL_OUTPUT):
+        d.mkdir(parents=True, exist_ok=True)
 
+
+# ---------------------------------------------------------------- 步骤
+
+def step_pin() -> None:
+    """android-tools 钉到 35.0.2。submodule 跟 master 会拉到 37.x，与 porting 代码不匹配。"""
+    ensure_dirs()
+    if not ANDROID_TOOLS.is_dir():
+        die(f"{ANDROID_TOOLS} 不存在，submodule 未检出")
+
+    log(f"钉住 android-tools -> {ANDROID_TOOLS_TAG}")
     run(["git", "fetch", "--tags", "--depth", "1", "origin",
          f"refs/tags/{ANDROID_TOOLS_TAG}:refs/tags/{ANDROID_TOOLS_TAG}"],
         cwd=ANDROID_TOOLS, check=False)
     run(["git", "checkout", "-f", f"tags/{ANDROID_TOOLS_TAG}"], cwd=ANDROID_TOOLS)
     run(["git", "submodule", "update", "--init", "--recursive", "--force"], cwd=ANDROID_TOOLS)
 
-    ver = run(["git", "describe", "--tags", "--always"], cwd=ANDROID_TOOLS,
-              capture=True).stdout.strip()
-    log(f"android-tools 当前版本: {ver}")
+    ver = run(["git", "describe", "--tags", "--always"], cwd=ANDROID_TOOLS, capture=True).stdout.strip()
+    log(f"android-tools = {ver}")
     if ANDROID_TOOLS_TAG not in ver:
-        die(f"版本钉失败，期望 {ANDROID_TOOLS_TAG}，实际 {ver}")
+        die(f"版本不符：期望 {ANDROID_TOOLS_TAG}，实际 {ver}")
 
 
-def step_verify_protoc() -> str:
-    """protoc 必须与 PROTOBUF_VERSION 一致，否则生成的 .pb.cc 和运行库 ABI 不符。"""
+def step_protoc() -> None:
+    """protoc 必须与运行库同版本，否则 .pb.cc 与库 ABI 不符。"""
     exe = shutil.which("protoc")
     if not exe:
-        die("protoc 未安装。macOS 上执行: brew install protobuf@28 或下载 28.3 官方二进制")
-    out = run([exe, "--version"], capture=True).stdout.strip()
-    ver = out.split()[-1]
+        die("protoc 未安装")
+    ver = run([exe, "--version"], capture=True).stdout.strip().split()[-1]
     log(f"protoc = {ver}")
     if ver != PROTOBUF_VERSION:
-        die(f"protoc 版本不符：期望 {PROTOBUF_VERSION}，实际 {ver}。"
-            f"新版 protobuf 会引入 absl/log/log.h 的裸 LOG 宏，与 adb_trace.h 冲突。")
-    return exe
+        die(
+            f"protoc 版本 {ver} != {PROTOBUF_VERSION}。"
+            f"protobuf 29+ 的 descriptor.h 会引入 absl/log/log.h（裸 LOG 宏），"
+            f"与 adb 的 adb_trace.h 冲突，报 'STATELESS 未声明'。"
+        )
 
 
-def step_build_protobuf() -> None:
-    """编译 iOS 版 protobuf 28.3，产物进 output/iphoneos/arm64/。"""
+def step_protobuf() -> None:
+    """编 iOS 版 protobuf 28.3 静态库。"""
+    ensure_dirs()
     log("编译 protobuf 28.3 (iOS)")
     script = ROOT / "porting" / "scripts" / "make-protobuf.sh"
     if not script.is_file():
-        die(f"找不到 {script}")
-    env = dict(os.environ, TARGET=TARGET, OUTPUT=str(OUTPUT))
-    run(["bash", str(script)], cwd=ROOT / "porting", env=env)
+        die(f"缺少 {script}")
+    run(["bash", str(script)], cwd=ROOT / "porting",
+        env=dict(os.environ, TARGET=TARGET, OUTPUT=str(OUTPUT)))
 
 
 def step_patch_cmake() -> None:
     """
-    让 adb 的 CMake 用我们自己编的 protobuf 28.3，而不是 Homebrew 的 36.x。
+    阻止 CMake 用 CONFIG 模式找到 Homebrew 的 protobuf 36.x。
 
-    上游 vendor/CMakeLists.txt 里 `find_package(Protobuf CONFIG)` 会优先命中
-    Homebrew 的 protobuf-config.cmake，从而把 /opt/homebrew/include 拉进 include path，
-    进而引入 absl/log/log.h 的 LOG 宏，与 adb_trace.h 的 LOG 冲突。
+    上游 vendor/CMakeLists.txt 的 `find_package(Protobuf CONFIG)` 会先把
+    /opt/homebrew 拉进 include path，之后 protobuf 的头文件就会把 absl 的
+    LOG 宏带进来，与 adb_trace.h 里同名宏直接冲突。
     """
-    log("patch vendor/CMakeLists.txt：强制使用本地 protobuf")
+    ensure_dirs()
     f = ANDROID_TOOLS / "vendor" / "CMakeLists.txt"
     if not f.is_file():
-        die(f"找不到 {f}")
+        die(f"缺少 {f}")
     text = f.read_text(encoding="utf-8", errors="ignore")
-    if "ADB_MOBILE_FORCE_LOCAL_PROTOBUF" in text:
-        log("已 patch 过，跳过")
+    if "LIBADB_NO_PROTOBUF_CONFIG" in text:
+        log("CMakeLists.txt 已 patch，跳过")
         return
 
-    patched = text.replace(
-        "find_package(Protobuf CONFIG)",
-        "# ADB_MOBILE_FORCE_LOCAL_PROTOBUF: 禁用 CONFIG 模式，避免命中 Homebrew 的 protobuf 36.x\n"
+    anchor = "find_package(Protobuf CONFIG)"
+    if anchor not in text:
+        die(f"patch 锚点 '{anchor}' 不存在，上游结构可能已变化")
+    text = text.replace(
+        anchor,
+        "# LIBADB_NO_PROTOBUF_CONFIG: 禁 CONFIG 模式，避免命中 Homebrew protobuf 36.x\n"
         "set(Protobuf_NO_CONFIG ON)\n"
         "set(protobuf_MODULE_COMPATIBLE ON)",
+        1,
     )
-    if patched == text:
-        die("patch 锚点未命中，vendor/CMakeLists.txt 结构可能已变化")
-    f.write_text(patched, encoding="utf-8")
-    log("patch 完成")
+    f.write_text(text, encoding="utf-8")
+    log("CMakeLists.txt patch 完成")
 
 
-def step_patch_make_adb() -> None:
-    """给 make-adb.sh 的 cmake 调用补上 protobuf 路径。"""
-    log("patch make-adb.sh：注入 protobuf 路径")
+def step_patch_makeadb() -> None:
+    """给 make-adb.sh 的 cmake 调用注入本地 protobuf 路径。"""
+    ensure_dirs()
     f = ROOT / "porting" / "scripts" / "make-adb.sh"
+    if not f.is_file():
+        die(f"缺少 {f}")
     text = f.read_text(encoding="utf-8")
-    if "ADB_MOBILE_PROTOBUF_PATHS" in text:
-        log("已 patch 过，跳过")
+    if "LIBADB_PROTOBUF_PATHS" in text:
+        log("make-adb.sh 已 patch，跳过")
         return
 
+    # 上游第 40 行精确为 '\t$CMAKE_COMPAT_FLAGS ..'
     anchor = "\t$CMAKE_COMPAT_FLAGS .."
+    if anchor not in text:
+        die(f"patch 锚点 {anchor!r} 不存在")
+
     inject = (
-        '\t-DADB_MOBILE_PROTOBUF_PATHS=1 \\\n'
+        "\t-DLIBADB_PROTOBUF_PATHS=1 \\\n"
         '\t-DProtobuf_INCLUDE_DIR="$SOURCE_ROOT/external/protobuf/src" \\\n'
+        '\t-DProtobuf_INCLUDE_DIRS="$SOURCE_ROOT/external/protobuf/src" \\\n'
         '\t-DProtobuf_LIBRARY="$FULL_OUTPUT/libprotobuf.a" \\\n'
         '\t-DProtobuf_PROTOC_EXECUTABLE="$(command -v protoc)" \\\n'
         + anchor
     )
-    if anchor not in text:
-        die("make-adb.sh 里找不到 cmake 锚点，上游脚本可能已变化")
-    f.write_text(text.replace(anchor, inject), encoding="utf-8")
-    log("patch 完成")
+    f.write_text(text.replace(anchor, inject, 1), encoding="utf-8")
+    log("make-adb.sh patch 完成")
 
 
-def step_build_adb() -> None:
+def step_adb() -> None:
+    ensure_dirs()
     log("编译 libadb (iOS)")
-    env = dict(os.environ, TARGET=TARGET, OUTPUT=str(OUTPUT))
     run(["bash", str(ROOT / "porting" / "scripts" / "make-adb.sh")],
-        cwd=ROOT / "porting", env=env)
+        cwd=ROOT / "porting",
+        env=dict(os.environ, TARGET=TARGET, OUTPUT=str(OUTPUT)))
 
 
 def step_collect() -> Path:
-    """把散落的 .a 合并成一个 libadb-full.a。"""
-    log("合并静态库")
+    """合并所有 .a 并校验对外符号。"""
+    ensure_dirs()
     libs = sorted(FULL_OUTPUT.glob("*.a"))
     if not libs:
-        die(f"{FULL_OUTPUT} 下没有任何 .a，构建实际未产出")
-    log(f"找到 {len(libs)} 个静态库: {[p.name for p in libs]}")
+        die(f"{FULL_OUTPUT} 下无 .a 产物")
+    log(f"找到 {len(libs)} 个静态库")
+    for p in libs:
+        log(f"  {p.name}  {p.stat().st_size:,} B")
 
     dist = ROOT / "dist"
-    (dist / "include").mkdir(parents=True, exist_ok=True)
+    inc = dist / "include"
+    inc.mkdir(parents=True, exist_ok=True)
+
     out = dist / "libadb-full.a"
     run(["libtool", "-static", "-o", str(out)] + [str(p) for p in libs])
 
-    for h in (ROOT / "porting" / "adb" / "include").glob("*.h"):
-        shutil.copy2(h, dist / "include" / h.name)
+    hdr_dir = ROOT / "porting" / "adb" / "include"
+    copied = 0
+    for h in hdr_dir.rglob("*.h"):
+        rel = h.relative_to(hdr_dir)
+        dst = inc / rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(h, dst)
+        copied += 1
+    log(f"复制 {copied} 个头文件")
 
     size = out.stat().st_size
     log(f"libadb-full.a = {size:,} B")
     if size < 500_000:
-        log(f"⚠️ 产物偏小（{size} B），可能链接不完整")
+        log(f"⚠️ 产物偏小（{size:,} B），可能链接不完整")
 
-    # 符号抽查：确认对外接口真的在
     nm = run(["nm", "-gU", str(out)], capture=True, check=False)
-    wanted = ["adb_commandline_porting", "adb_set_home", "adb_set_server_port"]
-    for sym in wanted:
-        found = sym in (nm.stdout or "")
-        log(f"符号 {sym}: {'✅' if found else '❌'}")
-        if not found:
-            die(f"关键符号 {sym} 缺失，库不可用")
+    syms = nm.stdout or ""
+    for sym in ["adb_commandline_porting", "adb_set_home", "adb_set_server_port"]:
+        ok = sym in syms
+        log(f"符号 {sym}: {'✅' if ok else '❌'}")
+        if not ok:
+            die(f"关键符号 {sym} 缺失")
     return out
+
+
+# ---------------------------------------------------------------- 入口
+
+STAGES = {
+    "pin": step_pin,
+    "protoc": step_protoc,
+    "protobuf": step_protobuf,
+    "patch": lambda: (step_patch_cmake(), step_patch_makeadb()),
+    "adb": step_adb,
+    "collect": step_collect,
+}
+ORDER = ["pin", "protoc", "protobuf", "patch", "adb", "collect"]
 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--stage", default="all",
-                    choices=["all", "pin", "protoc", "protobuf", "patch", "adb", "collect"])
-    ap.add_argument("--root", default=None, help="adb-mobile 源码根目录，默认当前目录")
+    ap.add_argument("--stage", default="all", choices=["all"] + ORDER)
+    ap.add_argument("--root", default=None)
     args = ap.parse_args()
 
     global ROOT, ANDROID_TOOLS, PROTOBUF_SRC, OUTPUT, FULL_OUTPUT
@@ -206,25 +247,17 @@ def main() -> None:
         PROTOBUF_SRC = ROOT / "external" / "protobuf"
         OUTPUT = ROOT / "output"
         FULL_OUTPUT = OUTPUT / TARGET
+
     log(f"ROOT = {ROOT}")
     if not (ROOT / "porting").is_dir():
-        die(f"{ROOT} 下没有 porting/，不是 adb-mobile 源码根。请用 --root 指定。")
+        die(f"{ROOT} 下没有 porting/，请用 --root 指定 adb-mobile 源码根")
+    ensure_dirs()
 
     t0 = time.time()
-    if args.stage in ("all", "pin"):
-        step_pin_android_tools()
-    if args.stage in ("all", "protoc"):
-        step_verify_protoc()
-    if args.stage in ("all", "protobuf"):
-        step_build_protobuf()
-    if args.stage in ("all", "patch"):
-        step_patch_cmake()
-        step_patch_make_adb()
-    if args.stage in ("all", "adb"):
-        step_build_adb()
-    if args.stage in ("all", "collect"):
-        step_collect()
-
+    stages = ORDER if args.stage == "all" else [args.stage]
+    for st in stages:
+        log(f"===== stage: {st} =====")
+        STAGES[st]()
     log(f"完成，耗时 {time.time() - t0:.1f}s")
 
 
