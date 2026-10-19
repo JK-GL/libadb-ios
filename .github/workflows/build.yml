@@ -61,7 +61,10 @@ jobs:
         run: |
           python3 ../builder/scripts/build_libadb.py --root "$PWD" --stage pin
           python3 ../builder/scripts/build_libadb.py --root "$PWD" --stage protoc
-          python3 ../builder/scripts/build_libadb.py --root "$PWD" --stage protobuf 2>&1 | tail -40
+          # patchpb 必须先跑：给 external/protobuf 拉 tags，否则 checkout v28.3 必失败
+          python3 ../builder/scripts/build_libadb.py --root "$PWD" --stage patchpb
+          set -o pipefail
+          python3 ../builder/scripts/build_libadb.py --root "$PWD" --stage protobuf
 
       - name: 打补丁
         working-directory: src
