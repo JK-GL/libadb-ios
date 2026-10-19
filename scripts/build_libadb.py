@@ -115,8 +115,12 @@ def step_patch_protobuf_submodule() -> None:
         die(f"{PROTOBUF_SRC} 不存在，external/protobuf submodule 未检出")
 
     log("为 external/protobuf 拉取全部 tags")
-    run(["git", "fetch", "--tags", "--unshallow"], cwd=PROTOBUF_SRC, check=False)
-    run(["git", "fetch", "--tags"], cwd=PROTOBUF_SRC, check=False)
+    # 直接对 upstream 拉，不依赖 submodule 的 origin 配置
+    PB_REMOTE = "https://github.com/protocolbuffers/protobuf.git"
+    run(["git", "fetch", "--tags", "--unshallow", PB_REMOTE], cwd=PROTOBUF_SRC, check=False)
+    run(["git", "fetch", "--tags", PB_REMOTE], cwd=PROTOBUF_SRC, check=False)
+    # 若 origin 存在也同步拉一次
+    run(["git", "fetch", "--tags", "origin"], cwd=PROTOBUF_SRC, check=False)
 
     tags = run(["git", "tag", "-l", "v28*"], cwd=PROTOBUF_SRC, capture=True).stdout.strip()
     log(f"匹配 v28* 的标签: {tags.split() if tags else '无'}")
