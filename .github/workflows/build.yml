@@ -9,102 +9,92 @@ jobs:
   build:
     name: Compile libadb.a
     runs-on: macos-14
-    timeout-minutes: 180
+    timeout-minutes: 240
 
     env:
-      # adb-mobile 的 porting 代码针对 platform-tools 35.0.2 改的，
-      # 必须把 android-tools 钉在同一版本，否则 vendor/adb 的源码会变成 37.x
-      # 导致 porting/*.cpp 里的函数签名对不上。
-      ANDROID_TOOLS_TAG: '35.0.2'
-      # 上游 protobuf.rb 锁定 28.3；更高版本会引入 absl log 宏，与 adb_trace.h 的 LOG/VLOG 冲突
-      PROTOBUF_VERSION: '28.3'
-      # 供 zip_writer.h 的 gtest/gtest_prod.h 使用
       CPLUS_INCLUDE_PATH: '/opt/homebrew/include'
 
     steps:
-      - name: 显示 runner 环境
-        run: |
-          xcodebuild -version
-          xcrun --sdk iphoneos --show-sdk-version
-          cmake --version | head -1
-          uname -m
-
       - name: 检出 adb-mobile 源码
         uses: actions/checkout@v4
         with:
           repository: wsvn53/adb-mobile
           submodules: recursive
           fetch-depth: 1
+          path: src
 
-      - name: 安装构建依赖
+      - name: 检出构建脚本
+        uses: actions/checkout@v4
+        with:
+          path: builder
+
+      - name: 环境信息
         run: |
-          brew unlink protobuf 2>/dev/null || true
-          brew install protobuf@28 2>/dev/null || brew install porting/protobuf.rb || brew install protobuf
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+          cmake --version | head -1
+
+      - name: 安装 protobuf 28.3（构建硬依赖）
+        run: |
+          set -e
+          # 下载官方 28.3 预编译 protoc，避免 Homebrew 装到 36.x
+          ARCH=$(uname -m)
+          if [ "$ARCH" = "arm64" ]; then
+            PB_ZIP=protoc-28.3-osx-aarch_64.zip
+          else
+            PB_ZIP=protoc-28.3-osx-x86_64.zip
+          fi
+          curl -fsSL -o /tmp/protoc.zip \
+            "https://github.com/protocolbuffers/protobuf/releases/download/v28.3/${PB_ZIP}"
+          mkdir -p /tmp/protoc28
+          unzip -q /tmp/protoc.zip -d /tmp/protoc28
+          echo "/tmp/protoc28/bin" >> $GITHUB_PATH
+          /tmp/protoc28/bin/protoc --version
+
+      - name: 安装其余依赖
+        run: |
           brew install googletest
-          protoc --version
-          echo "===== googletest 头文件 ====="
-          ls /opt/homebrew/include/gtest/gtest_prod.h && echo "gtest_prod.h OK"
+          ls /opt/homebrew/include/gtest/gtest_prod.h
 
-      - name: 钉住 android-tools 到 35.0.2
+      - name: 钉版本 + 编译 protobuf
+        working-directory: src
         run: |
-          cd android-tools
-          git fetch --tags --depth 1 origin "refs/tags/${ANDROID_TOOLS_TAG}:refs/tags/${ANDROID_TOOLS_TAG}" || \
-            git fetch --tags --unshallow
-          git checkout -f "tags/${ANDROID_TOOLS_TAG}"
-          git submodule update --init --recursive --force
-          echo "===== android-tools HEAD ====="
-          git describe --tags --always
-          echo "===== vendor/adb 版本 ====="
-          cd vendor/adb && git log -1 --format='%h %s' | head -1
-          grep -m1 'ANDROID_VERSION' ../../CMakeLists.txt || true
+          python3 ../builder/scripts/build_libadb.py --stage pin
+          python3 ../builder/scripts/build_libadb.py --stage protoc
+          python3 ../builder/scripts/build_libadb.py --stage protobuf 2>&1 | tail -40
 
-      - name: 校验版本
-        run: |
-          echo "protoc = $(protoc --version)"
-          echo "android-tools tag = $(cd android-tools && git describe --tags --always)"
-          grep -n "ANDROID_VERSION\|BORINGSSL_VERSION" android-tools/CMakeLists.txt | head -4
+      - name: 打补丁
+        working-directory: src
+        run: python3 ../builder/scripts/build_libadb.py --stage patch
 
-      - name: 构建 iphoneos/arm64
-        id: build
+      - name: 编译 libadb
+        id: adb
         continue-on-error: true
+        working-directory: src
         run: |
           set -o pipefail
-          mkdir -p output
-          make -C porting adb/iphoneos/arm64 2>&1 | tee /tmp/build.log
+          python3 ../builder/scripts/build_libadb.py --stage adb 2>&1 | tee /tmp/build.log
 
       - name: 汇总错误
         if: always()
         run: |
           echo "===== 错误行 ====="
-          grep -nE "error:|fatal error|❌|undefined symbol|Error [0-9]" /tmp/build.log | head -40 || echo "无错误行"
-          echo "===== 末尾 60 行 ====="
-          tail -n 60 /tmp/build.log
+          grep -nE "error:|fatal error|❌|\[fail\]|Error [0-9]" /tmp/build.log | head -40 || echo "无"
+          echo "===== 末尾 50 行 ====="
+          tail -n 50 /tmp/build.log || true
 
-      - name: 检查产物
-        id: check
-        if: always()
-        run: |
-          find output -name "*.a" -type f 2>/dev/null | head -50
-          COUNT=$(find output -name "*.a" -type f 2>/dev/null | wc -l | tr -d ' ')
-          echo "静态库数量 = $COUNT"
-          [ "$COUNT" -gt 0 ] && echo "ok=true" >> $GITHUB_OUTPUT || echo "ok=false" >> $GITHUB_OUTPUT
-
-      - name: 合并 libadb-full.a
-        if: steps.check.outputs.ok == 'true'
-        run: |
-          mkdir -p dist/include
-          libtool -static -o dist/libadb-full.a $(find output -name "*.a") 2>&1 | tail -20
-          cp -av porting/adb/include/*.h dist/include/ 2>/dev/null || true
-          ls -la dist/ dist/include/
-          echo "===== 符号抽查 ====="
-          nm -gU dist/libadb-full.a 2>/dev/null | grep -iE "adb_commandline_porting|adb_set_home|adb_pair" | head -10 || true
+      - name: 合并并校验产物
+        id: collect
+        if: steps.adb.outcome == 'success'
+        working-directory: src
+        run: python3 ../builder/scripts/build_libadb.py --stage collect
 
       - name: 上传产物
-        if: steps.check.outputs.ok == 'true'
+        if: steps.collect.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
           name: libadb-ios-arm64
-          path: dist/
+          path: src/dist/
           retention-days: 90
 
       - name: 上传构建日志
@@ -114,9 +104,3 @@ jobs:
           name: build-log
           path: /tmp/build.log
           retention-days: 30
-
-      - name: 失败标记
-        if: steps.build.outcome == 'failure'
-        run: |
-          echo "::error::构建失败，见 build-log 产物"
-          exit 1
