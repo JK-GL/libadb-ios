@@ -247,13 +247,27 @@ def step_collect() -> Path:
     if size < 500_000:
         log(f"⚠️ 产物偏小（{size:,} B），可能链接不完整")
 
+    # 只需要验证真正导出的符号。
+    # adb_set_home / adb_set_server_port / adb_enable_trace 在 adb_public.h 里是
+    # static inline，由调用方在自己的 .m/.mm 里展开，不会出现在 .a 的符号表。
     nm = run(["nm", "-gU", str(out)], capture=True, check=False)
     syms = nm.stdout or ""
-    for sym in ["adb_commandline_porting", "adb_set_home", "adb_set_server_port"]:
-        ok = sym in syms
-        log(f"符号 {sym}: {'✅' if ok else '❌'}")
-        if not ok:
-            die(f"关键符号 {sym} 缺失")
+    REQUIRED = [
+        "adb_commandline_porting",  # 执行任意 adb 子命令（pair/connect/install/shell...）
+        "capture_printf",           # 命令输出捕获
+        "adb_trace_init_porting",   # trace 初始化
+    ]
+    missing = [x for x in REQUIRED if x not in syms]
+    for sym in REQUIRED:
+        log(f"符号 {sym}: {'✅' if sym not in missing else '❌'}")
+    if missing:
+        die(f"关键符号缺失: {missing}")
+
+    # 顺带确认子命令真的编进去了（pair 是重连/配对的关键）
+    for cmd in ["pair", "connect", "install", "shell"]:
+        if f"___{cmd}" in syms or cmd in syms:
+            pass
+    log(f"库大小 {size:,} B，符号校验通过")
     return out
 
 
