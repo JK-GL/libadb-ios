@@ -1,0 +1,113 @@
+name: Build libadb for iOS
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      debug_keep_going:
+        description: 'adb 编译失败时继续尝试（调试用）'
+        required: false
+        default: 'false'
+
+jobs:
+  build:
+    name: Compile libadb.a
+    runs-on: macos-14
+    timeout-minutes: 180
+
+    steps:
+      - name: 显示 runner 环境
+        run: |
+          echo "===== Xcode ====="
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+          echo "===== CMake ====="
+          cmake --version
+          echo "===== Protoc ====="
+          protoc --version || echo "protoc 未预装"
+          echo "===== 架构 ====="
+          uname -m
+
+      - name: 检出 adb-mobile 源码
+        uses: actions/checkout@v4
+        with:
+          repository: wsvn53/adb-mobile
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: 安装 protobuf 28.3（构建硬依赖）
+        run: |
+          brew unlink protobuf 2>/dev/null || true
+          brew install porting/protobuf.rb || brew install protobuf@28.3 || brew install protobuf
+          protoc --version
+
+      - name: 校验 protobuf 版本
+        run: |
+          V=$(protoc --version | cut -d' ' -f2)
+          echo "protoc = $V"
+          grep "$V" porting/protobuf.rb || {
+            echo "::warning::protoc 版本 $V 与 protobuf.rb 中的版本不一致，继续尝试构建"
+          }
+
+      - name: 只构建 iphoneos/arm64 目标
+        id: build
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          mkdir -p output
+          make -C porting adb/iphoneos/arm64 2>&1 | tee /tmp/build.log
+
+      - name: 汇总构建日志（关键错误）
+        if: always()
+        run: |
+          echo "===== 最后 120 行 ====="
+          tail -n 120 /tmp/build.log || true
+          echo "===== 错误行 ====="
+          grep -iE "error:|fatal error|❌|failed|undefined symbol" /tmp/build.log | head -40 || echo "无错误行"
+
+      - name: 检查产物
+        id: check
+        if: always()
+        run: |
+          echo "===== output 目录 ====="
+          find output -type f -name "*.a" 2>/dev/null | head -40
+          COUNT=$(find output -type f -name "*.a" 2>/dev/null | wc -l | tr -d ' ')
+          echo "静态库数量 = $COUNT"
+          echo "count=$COUNT" >> $GITHUB_OUTPUT
+          if [ "$COUNT" -gt 0 ]; then
+            echo "ok=true" >> $GITHUB_OUTPUT
+          else
+            echo "ok=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: 合并为 libadb-full.a
+        if: steps.check.outputs.ok == 'true'
+        run: |
+          mkdir -p dist/include
+          libtool -static -o dist/libadb-full.a $(find output -name "*.a") 2>&1 | tail -20
+          cp -av porting/adb/include/*.h dist/include/ 2>/dev/null || true
+          ls -la dist/
+          ls -la dist/include/ 2>/dev/null | head -20
+
+      - name: 上传产物（静态库 + 头文件）
+        if: steps.check.outputs.ok == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: libadb-ios-arm64
+          path: dist/
+          retention-days: 90
+
+      - name: 上传完整构建日志
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: /tmp/build.log
+          retention-days: 30
+
+      - name: 构建失败时标记
+        if: steps.build.outcome == 'failure'
+        run: |
+          echo "::error::adb-mobile 构建失败，请查看 build-log 产物"
+          exit 1
