@@ -4,11 +4,6 @@ on:
   push:
     branches: [ main ]
   workflow_dispatch:
-    inputs:
-      debug_keep_going:
-        description: 'adb 编译失败时继续尝试（调试用）'
-        required: false
-        default: 'false'
 
 jobs:
   build:
@@ -16,17 +11,22 @@ jobs:
     runs-on: macos-14
     timeout-minutes: 180
 
+    env:
+      # adb-mobile 的 porting 代码针对 platform-tools 35.0.2 改的，
+      # 必须把 android-tools 钉在同一版本，否则 vendor/adb 的源码会变成 37.x
+      # 导致 porting/*.cpp 里的函数签名对不上。
+      ANDROID_TOOLS_TAG: '35.0.2'
+      # 上游 protobuf.rb 锁定 28.3；更高版本会引入 absl log 宏，与 adb_trace.h 的 LOG/VLOG 冲突
+      PROTOBUF_VERSION: '28.3'
+      # 供 zip_writer.h 的 gtest/gtest_prod.h 使用
+      CPLUS_INCLUDE_PATH: '/opt/homebrew/include'
+
     steps:
       - name: 显示 runner 环境
         run: |
-          echo "===== Xcode ====="
           xcodebuild -version
           xcrun --sdk iphoneos --show-sdk-version
-          echo "===== CMake ====="
-          cmake --version
-          echo "===== Protoc ====="
-          protoc --version || echo "protoc 未预装"
-          echo "===== 架构 ====="
+          cmake --version | head -1
           uname -m
 
       - name: 检出 adb-mobile 源码
@@ -36,21 +36,35 @@ jobs:
           submodules: recursive
           fetch-depth: 1
 
-      - name: 安装 protobuf 28.3（构建硬依赖）
+      - name: 安装构建依赖
         run: |
           brew unlink protobuf 2>/dev/null || true
-          brew install porting/protobuf.rb || brew install protobuf@28.3 || brew install protobuf
+          brew install protobuf@28 2>/dev/null || brew install porting/protobuf.rb || brew install protobuf
+          brew install googletest
           protoc --version
+          echo "===== googletest 头文件 ====="
+          ls /opt/homebrew/include/gtest/gtest_prod.h && echo "gtest_prod.h OK"
 
-      - name: 校验 protobuf 版本
+      - name: 钉住 android-tools 到 35.0.2
         run: |
-          V=$(protoc --version | cut -d' ' -f2)
-          echo "protoc = $V"
-          grep "$V" porting/protobuf.rb || {
-            echo "::warning::protoc 版本 $V 与 protobuf.rb 中的版本不一致，继续尝试构建"
-          }
+          cd android-tools
+          git fetch --tags --depth 1 origin "refs/tags/${ANDROID_TOOLS_TAG}:refs/tags/${ANDROID_TOOLS_TAG}" || \
+            git fetch --tags --unshallow
+          git checkout -f "tags/${ANDROID_TOOLS_TAG}"
+          git submodule update --init --recursive --force
+          echo "===== android-tools HEAD ====="
+          git describe --tags --always
+          echo "===== vendor/adb 版本 ====="
+          cd vendor/adb && git log -1 --format='%h %s' | head -1
+          grep -m1 'ANDROID_VERSION' ../../CMakeLists.txt || true
 
-      - name: 只构建 iphoneos/arm64 目标
+      - name: 校验版本
+        run: |
+          echo "protoc = $(protoc --version)"
+          echo "android-tools tag = $(cd android-tools && git describe --tags --always)"
+          grep -n "ANDROID_VERSION\|BORINGSSL_VERSION" android-tools/CMakeLists.txt | head -4
+
+      - name: 构建 iphoneos/arm64
         id: build
         continue-on-error: true
         run: |
@@ -58,39 +72,34 @@ jobs:
           mkdir -p output
           make -C porting adb/iphoneos/arm64 2>&1 | tee /tmp/build.log
 
-      - name: 汇总构建日志（关键错误）
+      - name: 汇总错误
         if: always()
         run: |
-          echo "===== 最后 120 行 ====="
-          tail -n 120 /tmp/build.log || true
           echo "===== 错误行 ====="
-          grep -iE "error:|fatal error|❌|failed|undefined symbol" /tmp/build.log | head -40 || echo "无错误行"
+          grep -nE "error:|fatal error|❌|undefined symbol|Error [0-9]" /tmp/build.log | head -40 || echo "无错误行"
+          echo "===== 末尾 60 行 ====="
+          tail -n 60 /tmp/build.log
 
       - name: 检查产物
         id: check
         if: always()
         run: |
-          echo "===== output 目录 ====="
-          find output -type f -name "*.a" 2>/dev/null | head -40
-          COUNT=$(find output -type f -name "*.a" 2>/dev/null | wc -l | tr -d ' ')
+          find output -name "*.a" -type f 2>/dev/null | head -50
+          COUNT=$(find output -name "*.a" -type f 2>/dev/null | wc -l | tr -d ' ')
           echo "静态库数量 = $COUNT"
-          echo "count=$COUNT" >> $GITHUB_OUTPUT
-          if [ "$COUNT" -gt 0 ]; then
-            echo "ok=true" >> $GITHUB_OUTPUT
-          else
-            echo "ok=false" >> $GITHUB_OUTPUT
-          fi
+          [ "$COUNT" -gt 0 ] && echo "ok=true" >> $GITHUB_OUTPUT || echo "ok=false" >> $GITHUB_OUTPUT
 
-      - name: 合并为 libadb-full.a
+      - name: 合并 libadb-full.a
         if: steps.check.outputs.ok == 'true'
         run: |
           mkdir -p dist/include
           libtool -static -o dist/libadb-full.a $(find output -name "*.a") 2>&1 | tail -20
           cp -av porting/adb/include/*.h dist/include/ 2>/dev/null || true
-          ls -la dist/
-          ls -la dist/include/ 2>/dev/null | head -20
+          ls -la dist/ dist/include/
+          echo "===== 符号抽查 ====="
+          nm -gU dist/libadb-full.a 2>/dev/null | grep -iE "adb_commandline_porting|adb_set_home|adb_pair" | head -10 || true
 
-      - name: 上传产物（静态库 + 头文件）
+      - name: 上传产物
         if: steps.check.outputs.ok == 'true'
         uses: actions/upload-artifact@v4
         with:
@@ -98,7 +107,7 @@ jobs:
           path: dist/
           retention-days: 90
 
-      - name: 上传完整构建日志
+      - name: 上传构建日志
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -106,8 +115,8 @@ jobs:
           path: /tmp/build.log
           retention-days: 30
 
-      - name: 构建失败时标记
+      - name: 失败标记
         if: steps.build.outcome == 'failure'
         run: |
-          echo "::error::adb-mobile 构建失败，请查看 build-log 产物"
+          echo "::error::构建失败，见 build-log 产物"
           exit 1
